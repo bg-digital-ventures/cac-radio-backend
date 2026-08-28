@@ -1,7 +1,9 @@
 import os
 import secrets
 import subprocess
+from dataclasses import dataclass
 from typing import Dict, Optional
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -12,13 +14,14 @@ load_dotenv()
 
 app = FastAPI(title="CAC Radio Live Backend")
 
-# --------------------------------------------------
+
+# =========================================================
 # CORS
-# --------------------------------------------------
+# =========================================================
 
 cors_origins = os.getenv(
     "CORS_ORIGINS",
-    "http://localhost:5500"
+    "https://cac-radio-frontend.vercel.app"
 )
 
 origins = [
@@ -35,52 +38,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------------------------------------------------
-# ICECAST / CASTER.FM SETTINGS
-# --------------------------------------------------
 
-ICECAST_HOST = os.getenv("ICECAST_HOST", "")
-ICECAST_PORT = os.getenv("ICECAST_PORT", "8000")
-ICECAST_USER = os.getenv("ICECAST_SOURCE_USER", "source")
-ICECAST_PASSWORD = os.getenv("ICECAST_SOURCE_PASSWORD", "")
-ICECAST_PUBLIC_BASE = os.getenv(
-    "ICECAST_PUBLIC_BASE",
-    ""
-).rstrip("/")
+# =========================================================
+# CASTER.FM / ICECAST SETTINGS
+# =========================================================
 
+ICECAST_HOST = os.getenv("ICECAST_HOST", "sapircast.caster.fm")
+ICECAST_PORT = os.getenv("ICECAST_PORT", "19269")
+ICECAST_SOURCE_USER = os.getenv("ICECAST_SOURCE_USER", "source")
+ICECAST_SOURCE_PASSWORD = os.getenv("ICECAST_SOURCE_PASSWORD", "")
 
-# --------------------------------------------------
-# LIVE SESSION
-# --------------------------------------------------
+# Your Caster.fm mount point
+ICECAST_MOUNT = os.getenv("ICECAST_MOUNT", "/vnFKR")
 
-class LiveSession:
-    def __init__(
-        self,
-        branch_id: str,
-        branch_name: str,
-        token: str,
-        mount: str
-    ):
-        self.branch_id = branch_id
-        self.branch_name = branch_name
-        self.token = token
-        self.mount = mount
-        self.process: Optional[subprocess.Popen] = None
+# Optional public stream base URL
+PUBLIC_BASE = os.getenv("ICECAST_PUBLIC_BASE", "").rstrip("/")
 
 
-sessions: Dict[str, LiveSession] = {}
+# =========================================================
+# LIVE SESSION STORAGE
+# =========================================================
+
+@dataclass
+class Session:
+    branch_id: str
+    branch_name: str
+    token: str
+    mount: str
+    process: Optional[subprocess.Popen] = None
+
+
+sessions: Dict[str, Session] = {}
 
 hq_relay_branch: Optional[str] = None
 
 
-# --------------------------------------------------
+# =========================================================
 # REQUEST MODELS
-# --------------------------------------------------
+# =========================================================
 
 class StartRequest(BaseModel):
     branchId: str
     branchName: str
-    title: str = ""
+    title: str
     presenter: Optional[str] = None
     programmeId: Optional[str] = None
 
@@ -94,64 +94,43 @@ class ConnectRequest(BaseModel):
     branchId: str
 
 
-# --------------------------------------------------
-# HELPERS
-# --------------------------------------------------
+# =========================================================
+# MOUNT POINT
+# =========================================================
 
 def mount_for(branch_id: str) -> str:
     """
-    Creates a safe Icecast mount point from the branch ID.
+    All branches currently broadcast through the Caster.fm
+    mount point configured in ICECAST_MOUNT.
     """
 
-    safe = "".join(
-        character
-        for character in branch_id
-        if character.isalnum() or character in "-_"
-    )
-
-    if not safe:
-        safe = "branch"
-
-    return "/" + safe + ".mp3"
+    return ICECAST_MOUNT
 
 
-def public_stream_url(mount: str) -> str:
-    """
-    Creates the public listening URL.
-    """
+# =========================================================
+# FFMPEG COMMAND
+# =========================================================
 
-    if ICECAST_PUBLIC_BASE:
-        return ICECAST_PUBLIC_BASE + mount
-
-    return mount
-
-
-def ffmpeg_command(mount: str):
-    """
-    Creates the FFmpeg command used to send browser audio
-    to the Icecast/Caster.fm server.
-    """
+def ffmpeg_cmd(mount: str):
 
     if not ICECAST_HOST:
-        raise RuntimeError(
-            "ICECAST_HOST is not configured."
-        )
+        raise RuntimeError("ICECAST_HOST is not configured.")
 
-    if not ICECAST_PASSWORD:
+    if not ICECAST_SOURCE_PASSWORD:
         raise RuntimeError(
             "ICECAST_SOURCE_PASSWORD is not configured."
         )
 
+    # Escape credentials in case the password contains
+    # characters such as @, :, /, #, etc.
+    safe_user = quote(ICECAST_SOURCE_USER, safe="")
+    safe_password = quote(ICECAST_SOURCE_PASSWORD, safe="")
+
     target = (
-        "icecast://"
-        + ICECAST_USER
-        + ":"
-        + ICECAST_PASSWORD
-        + "@"
-        + ICECAST_HOST
-        + ":"
-        + ICECAST_PORT
-        + mount
+        f"icecast://"
+        f"{safe_user}:{safe_password}@"
+        f"{ICECAST_HOST}:{ICECAST_PORT}"
+        f"{mount}"
     )
 
     return [
@@ -161,23 +140,29 @@ def ffmpeg_command(mount: str):
         "-loglevel",
         "warning",
 
+        # Browser sends WebM/Opus
         "-f",
         "webm",
 
         "-i",
         "pipe:0",
 
+        # Audio only
         "-vn",
 
+        # Stereo
         "-ac",
         "2",
 
+        # 44.1 kHz
         "-ar",
         "44100",
 
+        # Radio bitrate
         "-b:a",
         "96k",
 
+        # MP3 stream
         "-content_type",
         "audio/mpeg",
 
@@ -188,30 +173,31 @@ def ffmpeg_command(mount: str):
     ]
 
 
-# --------------------------------------------------
+# =========================================================
 # HEALTH CHECK
-# --------------------------------------------------
+# =========================================================
 
 @app.get("/")
 async def root():
     return {
-        "name": "CAC Radio Live Backend",
-        "status": "running"
+        "service": "CAC Radio Live Backend",
+        "status": "online",
     }
 
 
 @app.get("/api/health")
 async def health():
+
     return {
         "ok": True,
         "liveBranches": list(sessions.keys()),
-        "hqRelayBranch": hq_relay_branch
+        "hqRelayBranch": hq_relay_branch,
     }
 
 
-# --------------------------------------------------
+# =========================================================
 # START LIVE
-# --------------------------------------------------
+# =========================================================
 
 @app.post("/api/live/start")
 async def start_live(body: StartRequest):
@@ -226,46 +212,48 @@ async def start_live(body: StartRequest):
 
     mount = mount_for(body.branchId)
 
-    session = LiveSession(
+    session = Session(
         branch_id=body.branchId,
         branch_name=body.branchName,
         token=token,
-        mount=mount
+        mount=mount,
     )
 
     sessions[body.branchId] = session
 
+    public_stream_url = (
+        f"{PUBLIC_BASE}{mount}"
+        if PUBLIC_BASE
+        else mount
+    )
+
     return {
         "ok": True,
-        "branchId": body.branchId,
-        "branchName": body.branchName,
         "sessionToken": token,
         "mount": mount,
-        "publicStreamUrl": public_stream_url(mount)
+        "publicStreamUrl": public_stream_url,
     }
 
 
-# --------------------------------------------------
-# LIVE AUDIO WEBSOCKET
-# --------------------------------------------------
+# =========================================================
+# LIVE MICROPHONE WEBSOCKET
+# =========================================================
 
 @app.websocket("/ws/live/{branch_id}")
-async def live_websocket(
+async def live_ws(
     websocket: WebSocket,
     branch_id: str,
-    token: str
+    token: str,
 ):
 
     session = sessions.get(branch_id)
 
-    if session is None:
+    # Check session/token before accepting connection
+    if not session:
         await websocket.close(code=4404)
         return
 
-    if not secrets.compare_digest(
-        session.token,
-        token
-    ):
+    if not secrets.compare_digest(session.token, token):
         await websocket.close(code=4403)
         return
 
@@ -275,111 +263,107 @@ async def live_websocket(
 
     try:
 
-        command = ffmpeg_command(
-            session.mount
-        )
-
+        # Start FFmpeg
         process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE
+            ffmpeg_cmd(session.mount),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
 
         session.process = process
 
         while True:
 
-            audio_chunk = await websocket.receive_bytes()
+            # Receive microphone audio from browser
+            chunk = await websocket.receive_bytes()
 
             if process.poll() is not None:
                 raise RuntimeError(
-                    "FFmpeg stopped."
+                    "FFmpeg stopped unexpectedly."
                 )
 
-            if process.stdin is not None:
-                process.stdin.write(
-                    audio_chunk
+            if process.stdin is None:
+                raise RuntimeError(
+                    "FFmpeg input is unavailable."
                 )
-                process.stdin.flush()
+
+            process.stdin.write(chunk)
+            process.stdin.flush()
 
     except WebSocketDisconnect:
+
+        # Browser closed connection normally
         pass
 
-    except Exception as error:
+    except Exception as exc:
+
         print(
-            "Live streaming error:",
-            error
+            f"Live stream error for {branch_id}: {exc}",
+            flush=True
         )
 
     finally:
 
+        # Close FFmpeg input
         if process is not None:
 
-            if process.stdin is not None:
-                try:
-                    process.stdin.close()
-                except Exception:
-                    pass
-
             try:
-                process.terminate()
+                if process.stdin:
+                    process.stdin.close()
             except Exception:
                 pass
 
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
         session.process = None
 
-        sessions.pop(
-            branch_id,
-            None
-        )
+        # Remove session
+        sessions.pop(branch_id, None)
 
 
-# --------------------------------------------------
+# =========================================================
 # STOP LIVE
-# --------------------------------------------------
+# =========================================================
 
 @app.post("/api/live/stop")
 async def stop_live(body: StopRequest):
 
-    session = sessions.get(
-        body.branchId
-    )
+    session = sessions.get(body.branchId)
 
-    if session is not None:
+    if session and session.process:
 
-        if session.process is not None:
+        try:
+            session.process.terminate()
+        except Exception:
+            pass
 
-            try:
-                session.process.terminate()
-            except Exception:
-                pass
-
-    sessions.pop(
-        body.branchId,
-        None
-    )
+    sessions.pop(body.branchId, None)
 
     return {
-        "ok": True,
-        "branchId": body.branchId
+        "ok": True
     }
 
 
-# --------------------------------------------------
-# HQ CONNECT TO BRANCH
-# --------------------------------------------------
+# =========================================================
+# CONNECT BRANCH TO HQ
+# =========================================================
 
 @app.post("/api/live/connect-hq")
-async def connect_hq(
-    body: ConnectRequest
-):
+async def connect_hq(body: ConnectRequest):
 
     global hq_relay_branch
 
-    session = sessions.get(
-        body.branchId
-    )
+    session = sessions.get(body.branchId)
 
-    if session is None:
+    if not session:
         raise HTTPException(
             status_code=404,
             detail="That branch is not live."
@@ -387,18 +371,22 @@ async def connect_hq(
 
     hq_relay_branch = body.branchId
 
+    public_stream_url = (
+        f"{PUBLIC_BASE}{session.mount}"
+        if PUBLIC_BASE
+        else session.mount
+    )
+
     return {
         "ok": True,
         "branchId": body.branchId,
-        "publicStreamUrl": public_stream_url(
-            session.mount
-        )
+        "publicStreamUrl": public_stream_url,
     }
 
 
-# --------------------------------------------------
-# HQ DISCONNECT
-# --------------------------------------------------
+# =========================================================
+# DISCONNECT HQ
+# =========================================================
 
 @app.post("/api/live/disconnect-hq")
 async def disconnect_hq():
