@@ -265,11 +265,11 @@ async def live_ws(
 
         # Start FFmpeg
         process = subprocess.Popen(
-            ffmpeg_cmd(session.mount),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+    ffmpeg_cmd(session.mount),
+    stdin=subprocess.PIPE,
+    stdout=subprocess.DEVNULL,
+    stderr=None,
+)
 
         session.process = process
 
