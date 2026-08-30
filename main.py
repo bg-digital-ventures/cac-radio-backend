@@ -194,6 +194,32 @@ async def health():
         "hqRelayBranch": hq_relay_branch,
     }
 
+@app.get("/api/test-icecast")
+async def test_icecast():
+    import socket
+
+    try:
+        sock = socket.create_connection(
+            (ICECAST_HOST, int(ICECAST_PORT)),
+            timeout=10
+        )
+        sock.close()
+
+        return {
+            "ok": True,
+            "message": "Render can reach Caster.fm",
+            "host": ICECAST_HOST,
+            "port": ICECAST_PORT
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "message": str(e),
+            "host": ICECAST_HOST,
+            "port": ICECAST_PORT
+        }
+        
 
 # =========================================================
 # START LIVE
