@@ -651,33 +651,3 @@ async def disconnect_hq():
     return {
         "ok": True
     }
-    @app.get("/api/test-caster")
-async def test_caster():
-    import socket
-
-    results = {}
-
-    for port in [80, 443, 19269]:
-        try:
-            sock = socket.create_connection(
-                ("sapircast.caster.fm", port),
-                timeout=10
-            )
-            sock.close()
-
-            results[str(port)] = {
-                "ok": True,
-                "message": "Connection successful"
-            }
-
-        except Exception as e:
-            results[str(port)] = {
-                "ok": False,
-                "message": str(e)
-            }
-
-    return {
-        "host": "sapircast.caster.fm",
-        "results": results
-    }
-    
