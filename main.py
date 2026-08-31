@@ -1,12 +1,11 @@
 import os
 import secrets
-import subprocess
+import socket
 from dataclasses import dataclass
 from typing import Dict, Optional
-from urllib.parse import quote
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -108,7 +107,6 @@ class Session:
     token: str
     mount: str
     broadcast_id: Optional[str] = None
-    process: Optional[subprocess.Popen] = None
 
 
 sessions: Dict[str, Session] = {}
@@ -141,21 +139,23 @@ class ConnectRequest(BaseModel):
 # FIRESTORE HELPERS
 # =========================================================
 
-def mark_broadcast_ended(broadcast_id: Optional[str]):
+def mark_broadcast_ended(
+    broadcast_id: Optional[str]
+):
     """
     Mark the Firestore broadcast as ended.
 
-    This is called when:
-    - the broadcaster presses Stop Live
-    - the browser/WebSocket disconnects
-    - FFmpeg fails
+    This is called when the dashboard stops a broadcast
+    or when a live session is cleaned up.
     """
 
     if not broadcast_id:
         return
 
     try:
-        firestore_db.collection("broadcasts").document(
+        firestore_db.collection(
+            "broadcasts"
+        ).document(
             broadcast_id
         ).update({
             "status": "ended",
@@ -181,88 +181,61 @@ def mark_broadcast_ended(broadcast_id: Optional[str]):
 
 def mount_for(branch_id: str) -> str:
     """
-    All branches currently use the same Caster.fm
-    mount point.
+    Caster.fm Free currently uses the configured
+    mount point for the radio channel.
+
+    The branch ID is kept separate from the mount point
+    because multiple CAC branches may share the same
+    public radio channel.
     """
 
     return ICECAST_MOUNT
 
 
 # =========================================================
-# FFMPEG COMMAND
+# PUBLIC STREAM URL
 # =========================================================
 
-def ffmpeg_cmd(mount: str):
+def public_stream_url(mount: str) -> str:
+    """
+    Build the public listener URL when a public base URL
+    has been configured.
 
-    if not ICECAST_HOST:
-        raise RuntimeError(
-            "ICECAST_HOST is not configured."
-        )
+    If no public base is configured, return the mount only.
+    """
 
-    if not ICECAST_SOURCE_PASSWORD:
-        raise RuntimeError(
-            "ICECAST_SOURCE_PASSWORD is not configured."
-        )
+    if PUBLIC_BASE:
+        return f"{PUBLIC_BASE}{mount}"
 
-    safe_user = quote(
-        ICECAST_SOURCE_USER,
-        safe=""
-    )
-
-    safe_password = quote(
-        ICECAST_SOURCE_PASSWORD,
-        safe=""
-    )
-
-    target = (
-        f"icecast://"
-        f"{safe_user}:{safe_password}@"
-        f"{ICECAST_HOST}:{ICECAST_PORT}"
-        f"{mount}"
-    )
-
-    return [
-        "ffmpeg",
-
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-
-        # Browser sends WebM/Opus
-        "-f",
-        "webm",
-
-        "-i",
-        "pipe:0",
-
-        # Audio only
-        "-vn",
-
-        # Stereo
-        "-ac",
-        "2",
-
-        # 44.1 kHz
-        "-ar",
-        "44100",
-
-        # Radio bitrate
-        "-b:a",
-        "96k",
-
-        # MP3 stream
-        "-content_type",
-        "audio/mpeg",
-
-        "-f",
-        "mp3",
-
-        target,
-    ]
+    return mount
 
 
 # =========================================================
-# HEALTH CHECK
+# CASTER INFORMATION
+# =========================================================
+
+def caster_config():
+    """
+    Return the information needed by the external
+    Caster.fm-compatible broadcaster.
+
+    IMPORTANT:
+    The Caster.fm password is NEVER returned by this API.
+    """
+
+    return {
+        "host": ICECAST_HOST,
+        "port": int(ICECAST_PORT),
+        "username": ICECAST_SOURCE_USER,
+        "mount": ICECAST_MOUNT,
+        "protocol": "icecast",
+        "codec": "mp3",
+        "bitrate": "96k",
+    }
+
+
+# =========================================================
+# ROOT
 # =========================================================
 
 @app.get("/")
@@ -274,6 +247,10 @@ async def root():
     }
 
 
+# =========================================================
+# HEALTH CHECK
+# =========================================================
+
 @app.get("/api/health")
 async def health():
 
@@ -281,13 +258,20 @@ async def health():
         "ok": True,
         "liveBranches": list(sessions.keys()),
         "hqRelayBranch": hq_relay_branch,
+        "caster": {
+            "host": ICECAST_HOST,
+            "port": int(ICECAST_PORT),
+            "mount": ICECAST_MOUNT,
+        },
     }
 
 
+# =========================================================
+# TEST CASTER / ICECAST CONNECTION
+# =========================================================
+
 @app.get("/api/test-icecast")
 async def test_icecast():
-
-    import socket
 
     try:
 
@@ -308,22 +292,39 @@ async def test_icecast():
             "port": ICECAST_PORT,
         }
 
-    except Exception as e:
+    except Exception as exc:
 
         return {
             "ok": False,
-            "message": str(e),
+            "message": str(exc),
             "host": ICECAST_HOST,
             "port": ICECAST_PORT,
         }
 
 
 # =========================================================
-# START LIVE
+# CASTER CONFIG
+# =========================================================
+
+@app.get("/api/caster/config")
+async def get_caster_config():
+
+    return {
+        "ok": True,
+        "caster": caster_config(),
+    }
+
+
+# =========================================================
+# START LIVE SESSION
 # =========================================================
 
 @app.post("/api/live/start")
 async def start_live(body: StartRequest):
+
+    # -----------------------------------------------------
+    # Prevent duplicate live session
+    # -----------------------------------------------------
 
     if body.branchId in sessions:
         raise HTTPException(
@@ -331,9 +332,19 @@ async def start_live(body: StartRequest):
             detail="Branch is already live."
         )
 
+    # -----------------------------------------------------
+    # Create secure session token
+    # -----------------------------------------------------
+
     token = secrets.token_urlsafe(24)
 
-    mount = mount_for(body.branchId)
+    mount = mount_for(
+        body.branchId
+    )
+
+    # -----------------------------------------------------
+    # Create session
+    # -----------------------------------------------------
 
     session = Session(
         branch_id=body.branchId,
@@ -344,205 +355,82 @@ async def start_live(body: StartRequest):
 
     sessions[body.branchId] = session
 
-    public_stream_url = (
-        f"{PUBLIC_BASE}{mount}"
-        if PUBLIC_BASE
-        else mount
+    # -----------------------------------------------------
+    # Public listener URL
+    # -----------------------------------------------------
+
+    stream_url = public_stream_url(
+        mount
     )
+
+    print(
+        f"Live session prepared for "
+        f"{body.branchId}",
+        flush=True
+    )
+
+    # -----------------------------------------------------
+    # IMPORTANT
+    #
+    # Render does NOT start FFmpeg.
+    #
+    # Render does NOT receive browser microphone audio.
+    #
+    # Render does NOT attempt to connect to the
+    # Caster.fm source port.
+    #
+    # A Caster.fm-compatible broadcaster on the user's
+    # device is responsible for sending the microphone
+    # audio to Caster.fm.
+    # -----------------------------------------------------
 
     return {
         "ok": True,
         "sessionToken": token,
+        "branchId": body.branchId,
+        "branchName": body.branchName,
         "mount": mount,
-        "publicStreamUrl": public_stream_url,
+        "publicStreamUrl": stream_url,
+        "caster": caster_config(),
+        "message": (
+            "Live session prepared. "
+            "Connect your broadcaster to Caster.fm."
+        ),
     }
 
 
 # =========================================================
-# LIVE MICROPHONE WEBSOCKET
+# GET LIVE SESSION
 # =========================================================
 
-@app.websocket("/ws/live/{branch_id}")
-async def live_ws(
-    websocket: WebSocket,
-    branch_id: str,
-    token: str,
-    broadcastId: Optional[str] = None,
+@app.get("/api/live/session/{branch_id}")
+async def get_live_session(
+    branch_id: str
 ):
 
-    session = sessions.get(branch_id)
-
-    # -----------------------------------------------------
-    # Check live session
-    # -----------------------------------------------------
+    session = sessions.get(
+        branch_id
+    )
 
     if not session:
 
-        await websocket.close(code=4404)
+        return {
+            "ok": True,
+            "live": False,
+            "branchId": branch_id,
+        }
 
-        return
-
-    # -----------------------------------------------------
-    # Check security token
-    # -----------------------------------------------------
-
-    if not secrets.compare_digest(
-        session.token,
-        token
-    ):
-
-        await websocket.close(code=4403)
-
-        return
-
-    # -----------------------------------------------------
-    # Save broadcast ID
-    # -----------------------------------------------------
-
-    if broadcastId:
-
-        session.broadcast_id = broadcastId
-
-    # -----------------------------------------------------
-    # Accept WebSocket
-    # -----------------------------------------------------
-
-    await websocket.accept()
-
-    process = None
-
-    try:
-
-        # -------------------------------------------------
-        # Start FFmpeg
-        # -------------------------------------------------
-
-        process = subprocess.Popen(
-            ffmpeg_cmd(session.mount),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=None,
-        )
-
-        session.process = process
-
-        print(
-            f"Live stream started for "
-            f"{branch_id}",
-            flush=True
-        )
-
-        # -------------------------------------------------
-        # Receive microphone audio
-        # -------------------------------------------------
-
-        while True:
-
-            chunk = await websocket.receive_bytes()
-
-            # ---------------------------------------------
-            # Check FFmpeg
-            # ---------------------------------------------
-
-            if process.poll() is not None:
-
-                raise RuntimeError(
-                    "FFmpeg stopped unexpectedly."
-                )
-
-            if process.stdin is None:
-
-                raise RuntimeError(
-                    "FFmpeg input is unavailable."
-                )
-
-            # ---------------------------------------------
-            # Send audio to FFmpeg
-            # ---------------------------------------------
-
-            process.stdin.write(chunk)
-            process.stdin.flush()
-
-    except WebSocketDisconnect:
-
-        print(
-            f"Live WebSocket disconnected "
-            f"for {branch_id}.",
-            flush=True
-        )
-
-    except Exception as exc:
-
-        print(
-            f"Live stream error for "
-            f"{branch_id}: {exc}",
-            flush=True
-        )
-
-    finally:
-
-        # -------------------------------------------------
-        # Stop FFmpeg
-        # -------------------------------------------------
-
-        if process is not None:
-
-            try:
-
-                if process.stdin:
-
-                    process.stdin.close()
-
-            except Exception:
-
-                pass
-
-            try:
-
-                process.terminate()
-
-                process.wait(
-                    timeout=5
-                )
-
-            except Exception:
-
-                try:
-
-                    process.kill()
-
-                except Exception:
-
-                    pass
-
-        # -------------------------------------------------
-        # Clear process
-        # -------------------------------------------------
-
-        session.process = None
-
-        # -------------------------------------------------
-        # Mark Firestore broadcast ended
-        # -------------------------------------------------
-
-        mark_broadcast_ended(
-            session.broadcast_id
-        )
-
-        # -------------------------------------------------
-        # Remove live session
-        # -------------------------------------------------
-
-        sessions.pop(
-            branch_id,
-            None
-        )
-
-        print(
-            f"Live session cleaned up "
-            f"for {branch_id}.",
-            flush=True
-        )
+    return {
+        "ok": True,
+        "live": True,
+        "branchId": session.branch_id,
+        "branchName": session.branch_name,
+        "mount": session.mount,
+        "broadcastId": session.broadcast_id,
+        "publicStreamUrl": public_stream_url(
+            session.mount
+        ),
+    }
 
 
 # =========================================================
@@ -556,6 +444,10 @@ async def stop_live(body: StopRequest):
         body.branchId
     )
 
+    # -----------------------------------------------------
+    # Determine broadcast ID
+    # -----------------------------------------------------
+
     broadcast_id = (
         body.broadcastId
         if body.broadcastId
@@ -567,21 +459,7 @@ async def stop_live(body: StopRequest):
     )
 
     # -----------------------------------------------------
-    # Stop FFmpeg
-    # -----------------------------------------------------
-
-    if session and session.process:
-
-        try:
-
-            session.process.terminate()
-
-        except Exception:
-
-            pass
-
-    # -----------------------------------------------------
-    # Mark broadcast ended
+    # Mark Firestore broadcast ended
     # -----------------------------------------------------
 
     mark_broadcast_ended(
@@ -597,8 +475,16 @@ async def stop_live(body: StopRequest):
         None
     )
 
+    print(
+        f"Live session stopped for "
+        f"{body.branchId}.",
+        flush=True
+    )
+
     return {
-        "ok": True
+        "ok": True,
+        "branchId": body.branchId,
+        "message": "Live session stopped.",
     }
 
 
@@ -611,6 +497,10 @@ async def connect_hq(body: ConnectRequest):
 
     global hq_relay_branch
 
+    # -----------------------------------------------------
+    # Check branch session
+    # -----------------------------------------------------
+
     session = sessions.get(
         body.branchId
     )
@@ -622,18 +512,24 @@ async def connect_hq(body: ConnectRequest):
             detail="That branch is not live."
         )
 
+    # -----------------------------------------------------
+    # Save HQ relay branch
+    # -----------------------------------------------------
+
     hq_relay_branch = body.branchId
 
-    public_stream_url = (
-        f"{PUBLIC_BASE}{session.mount}"
-        if PUBLIC_BASE
-        else session.mount
+    stream_url = public_stream_url(
+        session.mount
     )
 
     return {
         "ok": True,
         "branchId": body.branchId,
-        "publicStreamUrl": public_stream_url,
+        "publicStreamUrl": stream_url,
+        "mount": session.mount,
+        "message": (
+            "Branch connected to Headquarters output."
+        ),
     }
 
 
@@ -649,5 +545,6 @@ async def disconnect_hq():
     hq_relay_branch = None
 
     return {
-        "ok": True
+        "ok": True,
+        "message": "HQ relay disconnected.",
     }
