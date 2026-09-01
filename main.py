@@ -1,4 +1,3 @@
-```python
 import os
 import secrets
 import socket
@@ -1205,4 +1204,3 @@ async def disconnect_hq():
         "message":
             "HQ relay disconnected."
     }
-```
