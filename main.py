@@ -2,6 +2,7 @@ import os
 import secrets
 import socket
 import subprocess
+import threading
 from dataclasses import dataclass
 from typing import Dict, Optional
 from urllib.parse import quote
@@ -353,7 +354,30 @@ def ffmpeg_cmd(
 
         "-loglevel",
 
-        "warning",
+        "info",
+def log_ffmpeg_output(process, branch_id):
+    try:
+        if process.stderr:
+            for line in iter(
+                process.stderr.readline,
+                b""
+            ):
+                if not line:
+                    break
+
+                print(
+                    f"[FFmpeg {branch_id}] "
+                    f"{line.decode(errors='replace').rstrip()}",
+                    flush=True
+                )
+
+    except Exception as exc:
+        print(
+            f"FFmpeg log reader error for "
+            f"{branch_id}: {exc}",
+            flush=True
+        )
+        
 
         # -------------------------------------------------
         # Browser audio input
@@ -880,22 +904,28 @@ async def live_ws(
         )
 
 
-        process = subprocess.Popen(
+       process = subprocess.Popen(
 
-            command,
+    command,
 
-            stdin=subprocess.PIPE,
+    stdin=subprocess.PIPE,
 
-            stdout=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
 
-            stderr=None,
+    stderr=subprocess.PIPE,
 
-            bufsize=0
+    bufsize=0
 
-        )
+)
+
+session.process = process
 
 
-        session.process = process
+threading.Thread(
+    target=log_ffmpeg_output,
+    args=(process, branch_id),
+    daemon=True
+).start()
 
 
         print(
