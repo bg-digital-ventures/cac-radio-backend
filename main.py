@@ -36,7 +36,6 @@ app = FastAPI(title="CAC Radio Live Backend")
 
 FIREBASE_CREDENTIALS = "/etc/secrets/firebase-service-account.json"
 
-
 if not firebase_admin._apps:
 
     if not os.path.exists(FIREBASE_CREDENTIALS):
@@ -64,13 +63,11 @@ cors_origins = os.getenv(
     "https://cac-radio-frontend.vercel.app"
 )
 
-
 origins = [
     origin.strip()
     for origin in cors_origins.split(",")
     if origin.strip()
 ]
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -90,30 +87,25 @@ ICECAST_HOST = os.getenv(
     "sapircast.caster.fm"
 )
 
-
 ICECAST_PORT = os.getenv(
     "ICECAST_PORT",
     "19269"
 )
-
 
 ICECAST_SOURCE_USER = os.getenv(
     "ICECAST_SOURCE_USER",
     "source"
 )
 
-
 ICECAST_SOURCE_PASSWORD = os.getenv(
     "ICECAST_SOURCE_PASSWORD",
     ""
 )
 
-
 ICECAST_MOUNT = os.getenv(
     "ICECAST_MOUNT",
     "/vnFKR"
 )
-
 
 PUBLIC_BASE = os.getenv(
     "ICECAST_PUBLIC_BASE",
@@ -140,9 +132,10 @@ class Session:
 
     process: Optional[subprocess.Popen] = None
 
+    stopping: bool = False
+
 
 sessions: Dict[str, Session] = {}
-
 
 hq_relay_branch: Optional[str] = None
 
@@ -285,7 +278,6 @@ def caster_config():
 
         "bitrate":
             "96k"
-
     }
 
 
@@ -316,25 +308,21 @@ def ffmpeg_cmd(
             "ICECAST_HOST is not configured."
         )
 
-
     if not ICECAST_SOURCE_PASSWORD:
 
         raise RuntimeError(
             "ICECAST_SOURCE_PASSWORD is not configured."
         )
 
-
     safe_user = quote(
         ICECAST_SOURCE_USER,
         safe=""
     )
 
-
     safe_password = quote(
         ICECAST_SOURCE_PASSWORD,
         safe=""
     )
-
 
     target = (
         f"icecast://"
@@ -345,7 +333,6 @@ def ffmpeg_cmd(
         f"{mount}"
     )
 
-
     return [
 
         "ffmpeg",
@@ -353,42 +340,16 @@ def ffmpeg_cmd(
         "-hide_banner",
 
         "-loglevel",
-
-        "info",
-def log_ffmpeg_output(process, branch_id):
-    try:
-        if process.stderr:
-            for line in iter(
-                process.stderr.readline,
-                b""
-            ):
-                if not line:
-                    break
-
-                print(
-                    f"[FFmpeg {branch_id}] "
-                    f"{line.decode(errors='replace').rstrip()}",
-                    flush=True
-                )
-
-    except Exception as exc:
-        print(
-            f"FFmpeg log reader error for "
-            f"{branch_id}: {exc}",
-            flush=True
-        )
-        
+        "warning",
 
         # -------------------------------------------------
         # Browser audio input
         # -------------------------------------------------
 
         "-f",
-
         "webm",
 
         "-i",
-
         "pipe:0",
 
         # -------------------------------------------------
@@ -402,7 +363,6 @@ def log_ffmpeg_output(process, branch_id):
         # -------------------------------------------------
 
         "-ac",
-
         "2",
 
         # -------------------------------------------------
@@ -410,7 +370,6 @@ def log_ffmpeg_output(process, branch_id):
         # -------------------------------------------------
 
         "-ar",
-
         "44100",
 
         # -------------------------------------------------
@@ -418,7 +377,6 @@ def log_ffmpeg_output(process, branch_id):
         # -------------------------------------------------
 
         "-b:a",
-
         "96k",
 
         # -------------------------------------------------
@@ -426,7 +384,6 @@ def log_ffmpeg_output(process, branch_id):
         # -------------------------------------------------
 
         "-content_type",
-
         "audio/mpeg",
 
         # -------------------------------------------------
@@ -434,12 +391,184 @@ def log_ffmpeg_output(process, branch_id):
         # -------------------------------------------------
 
         "-f",
-
         "mp3",
 
         target
-
     ]
+
+
+# =========================================================
+# FFMPEG LOGGING
+# =========================================================
+
+def log_ffmpeg_output(
+    process,
+    branch_id
+):
+
+    """
+    Read FFmpeg stderr in a separate thread.
+
+    This prevents the stderr pipe from filling up
+    and blocking FFmpeg.
+    """
+
+    try:
+
+        if process.stderr is None:
+            return
+
+        for line in iter(
+            process.stderr.readline,
+            b""
+        ):
+
+            if not line:
+                break
+
+            text = line.decode(
+                errors="replace"
+            ).rstrip()
+
+            if text:
+
+                print(
+                    f"[FFmpeg {branch_id}] {text}",
+                    flush=True
+                )
+
+    except Exception as exc:
+
+        print(
+            f"FFmpeg log reader error for "
+            f"{branch_id}: {exc}",
+            flush=True
+        )
+
+
+# =========================================================
+# STOP PROCESS HELPER
+# =========================================================
+
+def stop_ffmpeg(
+    process
+):
+
+    if process is None:
+        return
+
+    try:
+
+        if process.stdin:
+
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
+
+        if process.poll() is None:
+
+            process.terminate()
+
+            try:
+
+                process.wait(
+                    timeout=5
+                )
+
+            except subprocess.TimeoutExpired:
+
+                print(
+                    "FFmpeg did not terminate; killing process.",
+                    flush=True
+                )
+
+                process.kill()
+
+                try:
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
+
+    except Exception as exc:
+
+        print(
+            f"Unable to stop FFmpeg: {exc}",
+            flush=True
+        )
+
+
+# =========================================================
+# CLEANUP SESSION
+# =========================================================
+
+def cleanup_session(
+    branch_id: str,
+    session: Optional[Session] = None
+):
+
+    """
+    Central cleanup function.
+
+    This makes sure:
+
+    1. FFmpeg stops
+    2. Firestore becomes ended
+    3. in-memory session disappears
+    """
+
+    if session is None:
+
+        session = sessions.get(
+            branch_id
+        )
+
+    if session is None:
+        return
+
+    session.stopping = True
+
+    # -----------------------------------------------------
+    # Stop FFmpeg
+    # -----------------------------------------------------
+
+    process = session.process
+
+    session.process = None
+
+    if process:
+
+        stop_ffmpeg(
+            process
+        )
+
+    # -----------------------------------------------------
+    # Firestore
+    # -----------------------------------------------------
+
+    mark_broadcast_ended(
+        session.broadcast_id
+    )
+
+    # -----------------------------------------------------
+    # Remove session
+    # -----------------------------------------------------
+
+    current = sessions.get(
+        branch_id
+    )
+
+    if current is session:
+
+        sessions.pop(
+            branch_id,
+            None
+        )
+
+    print(
+        f"Live session cleaned up for {branch_id}.",
+        flush=True
+    )
 
 
 # =========================================================
@@ -456,7 +585,6 @@ async def root():
 
         "status":
             "online"
-
     }
 
 
@@ -489,9 +617,7 @@ async def health():
 
                 "mount":
                     ICECAST_MOUNT
-
             }
-
     }
 
 
@@ -512,11 +638,9 @@ async def test_icecast():
             ),
 
             timeout=10
-
         )
 
         sock.close()
-
 
         return {
 
@@ -531,9 +655,7 @@ async def test_icecast():
 
             "port":
                 int(ICECAST_PORT)
-
         }
-
 
     except Exception as exc:
 
@@ -550,7 +672,6 @@ async def test_icecast():
 
             "port":
                 int(ICECAST_PORT)
-
         }
 
 
@@ -568,7 +689,6 @@ async def get_caster_config():
 
         "caster":
             caster_config()
-
     }
 
 
@@ -585,23 +705,26 @@ async def start_live(
     # Prevent duplicate live session
     # -----------------------------------------------------
 
-    if body.branchId in sessions:
+    existing = sessions.get(
+        body.branchId
+    )
+
+    if existing:
 
         raise HTTPException(
 
             status_code=409,
 
             detail="Branch is already live."
-
         )
-
 
     # -----------------------------------------------------
     # Generate secure browser session token
     # -----------------------------------------------------
 
-    token = secrets.token_urlsafe(24)
-
+    token = secrets.token_urlsafe(
+        24
+    )
 
     # -----------------------------------------------------
     # Determine Caster mount
@@ -610,7 +733,6 @@ async def start_live(
     mount = mount_for(
         body.branchId
     )
-
 
     # -----------------------------------------------------
     # Create session
@@ -629,14 +751,11 @@ async def start_live(
 
         mount=
             mount
-
     )
-
 
     sessions[
         body.branchId
     ] = session
-
 
     # -----------------------------------------------------
     # Public listener URL
@@ -646,16 +765,13 @@ async def start_live(
         mount
     )
 
-
     print(
 
         f"Live session prepared for "
         f"{body.branchId}",
 
         flush=True
-
     )
-
 
     return {
 
@@ -682,7 +798,6 @@ async def start_live(
 
         "message":
             "Live session ready. Connect the browser microphone."
-
     }
 
 
@@ -701,7 +816,6 @@ async def get_live_session(
         branch_id
     )
 
-
     if not session:
 
         return {
@@ -714,9 +828,7 @@ async def get_live_session(
 
             "branchId":
                 branch_id
-
         }
-
 
     return {
 
@@ -742,7 +854,6 @@ async def get_live_session(
             public_stream_url(
                 session.mount
             )
-
     }
 
 
@@ -771,9 +882,7 @@ async def live_ws(
         f"for branch={branch_id}",
 
         flush=True
-
     )
-
 
     # -----------------------------------------------------
     # Find active session
@@ -783,7 +892,6 @@ async def live_ws(
         branch_id
     )
 
-
     if session is None:
 
         print(
@@ -792,11 +900,7 @@ async def live_ws(
             f"no active session for {branch_id}",
 
             flush=True
-
         )
-
-        # Accept first so the browser does not receive
-        # an HTTP 403 handshake response.
 
         await websocket.accept()
 
@@ -806,13 +910,11 @@ async def live_ws(
 
         return
 
-
     # -----------------------------------------------------
     # Accept WebSocket
     # -----------------------------------------------------
 
     await websocket.accept()
-
 
     # -----------------------------------------------------
     # Validate token
@@ -826,7 +928,6 @@ async def live_ws(
             f"missing token for {branch_id}",
 
             flush=True
-
         )
 
         await websocket.close(
@@ -834,7 +935,6 @@ async def live_ws(
         )
 
         return
-
 
     if not secrets.compare_digest(
 
@@ -850,7 +950,6 @@ async def live_ws(
             f"invalid token for {branch_id}",
 
             flush=True
-
         )
 
         await websocket.close(
@@ -858,7 +957,6 @@ async def live_ws(
         )
 
         return
-
 
     # -----------------------------------------------------
     # Save Firestore broadcast ID
@@ -870,19 +968,15 @@ async def live_ws(
             broadcastId
         )
 
-
     print(
 
         f"WebSocket authenticated "
         f"for {branch_id}",
 
         flush=True
-
     )
 
-
     process = None
-
 
     try:
 
@@ -894,48 +988,51 @@ async def live_ws(
             session.mount
         )
 
-
         print(
 
             f"Starting FFmpeg for {branch_id}",
 
             flush=True
-
         )
 
+        process = subprocess.Popen(
 
-       process = subprocess.Popen(
+            command,
 
-    command,
+            stdin=subprocess.PIPE,
 
-    stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
 
-    stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
 
-    stderr=subprocess.PIPE,
+            bufsize=0
+        )
 
-    bufsize=0
+        session.process = process
 
-)
+        # -------------------------------------------------
+        # Start FFmpeg log reader
+        # -------------------------------------------------
 
-session.process = process
+        threading.Thread(
 
+            target=log_ffmpeg_output,
 
-threading.Thread(
-    target=log_ffmpeg_output,
-    args=(process, branch_id),
-    daemon=True
-).start()
+            args=(
+                process,
+                branch_id
+            ),
 
+            daemon=True
+
+        ).start()
 
         print(
 
             f"FFmpeg started for {branch_id}",
 
             flush=True
-
         )
-
 
         # =================================================
         # RECEIVE BROWSER MICROPHONE AUDIO
@@ -947,7 +1044,6 @@ threading.Thread(
                 await websocket.receive_bytes()
             )
 
-
             # ---------------------------------------------
             # Check FFmpeg
             # ---------------------------------------------
@@ -957,9 +1053,7 @@ threading.Thread(
                 raise RuntimeError(
 
                     "FFmpeg stopped unexpectedly."
-
                 )
-
 
             # ---------------------------------------------
             # Make sure stdin exists
@@ -970,9 +1064,7 @@ threading.Thread(
                 raise RuntimeError(
 
                     "FFmpeg input is unavailable."
-
                 )
-
 
             # ---------------------------------------------
             # Send WebM audio to FFmpeg
@@ -991,9 +1083,7 @@ threading.Thread(
                 raise RuntimeError(
 
                     "FFmpeg pipe closed unexpectedly."
-
                 )
-
 
     except WebSocketDisconnect:
 
@@ -1003,9 +1093,7 @@ threading.Thread(
             f"for {branch_id}.",
 
             flush=True
-
         )
-
 
     except Exception as exc:
 
@@ -1015,90 +1103,17 @@ threading.Thread(
             f"{branch_id}: {exc}",
 
             flush=True
-
         )
-
 
     finally:
 
         # =================================================
-        # STOP FFMPEG
+        # CLEANUP
         # =================================================
 
-        if process is not None:
-
-            try:
-
-                if process.stdin:
-
-                    process.stdin.close()
-
-            except Exception:
-
-                pass
-
-
-            try:
-
-                if process.poll() is None:
-
-                    process.terminate()
-
-                    process.wait(
-                        timeout=5
-                    )
-
-            except Exception:
-
-                try:
-
-                    if process.poll() is None:
-
-                        process.kill()
-
-                except Exception:
-
-                    pass
-
-
-        # =================================================
-        # CLEAR PROCESS
-        # =================================================
-
-        session.process = None
-
-
-        # =================================================
-        # MARK FIRESTORE BROADCAST ENDED
-        # =================================================
-
-        mark_broadcast_ended(
-
-            session.broadcast_id
-
-        )
-
-
-        # =================================================
-        # REMOVE SESSION
-        # =================================================
-
-        sessions.pop(
-
+        cleanup_session(
             branch_id,
-
-            None
-
-        )
-
-
-        print(
-
-            f"Live session cleaned up "
-            f"for {branch_id}.",
-
-            flush=True
-
+            session
         )
 
 
@@ -1115,95 +1130,54 @@ async def stop_live(
         body.branchId
     )
 
-
     # -----------------------------------------------------
-    # Determine broadcast ID
-    # -----------------------------------------------------
-
-    broadcast_id = (
-
-        body.broadcastId
-
-        if body.broadcastId
-
-        else (
-
-            session.broadcast_id
-
-            if session
-
-            else None
-
-        )
-
-    )
-
-
-    # -----------------------------------------------------
-    # Stop FFmpeg
+    # If session exists
     # -----------------------------------------------------
 
-    if session and session.process:
+    if session:
 
-        try:
+        # If frontend supplied broadcastId,
+        # make sure session knows it.
 
-            if session.process.poll() is None:
+        if body.broadcastId:
 
-                session.process.terminate()
-
-                try:
-
-                    session.process.wait(
-                        timeout=5
-                    )
-
-                except subprocess.TimeoutExpired:
-
-                    session.process.kill()
-
-        except Exception as exc:
-
-            print(
-
-                f"Unable to stop FFmpeg "
-                f"for {body.branchId}: {exc}",
-
-                flush=True
-
+            session.broadcast_id = (
+                body.broadcastId
             )
 
+        print(
 
-    # -----------------------------------------------------
-    # Mark Firestore broadcast ended
-    # -----------------------------------------------------
+            f"Stopping live session for "
+            f"{body.branchId}",
 
-    mark_broadcast_ended(
-        broadcast_id
-    )
+            flush=True
+        )
 
+        cleanup_session(
+            body.branchId,
+            session
+        )
 
-    # -----------------------------------------------------
-    # Remove session
-    # -----------------------------------------------------
+    else:
 
-    sessions.pop(
+        # -------------------------------------------------
+        # No memory session.
+        #
+        # Still mark the Firestore broadcast ended if
+        # the frontend supplied its ID.
+        # -------------------------------------------------
 
-        body.branchId,
+        print(
 
-        None
+            f"No active backend session found for "
+            f"{body.branchId}. Cleaning Firestore anyway.",
 
-    )
+            flush=True
+        )
 
-
-    print(
-
-        f"Live session stopped for "
-        f"{body.branchId}.",
-
-        flush=True
-
-    )
-
+        mark_broadcast_ended(
+            body.broadcastId
+        )
 
     return {
 
@@ -1215,7 +1189,6 @@ async def stop_live(
 
         "message":
             "Live session stopped."
-
     }
 
 
@@ -1230,7 +1203,6 @@ async def connect_hq(
 
     global hq_relay_branch
 
-
     # -----------------------------------------------------
     # Find branch session
     # -----------------------------------------------------
@@ -1239,7 +1211,6 @@ async def connect_hq(
         body.branchId
     )
 
-
     if not session:
 
         raise HTTPException(
@@ -1247,9 +1218,7 @@ async def connect_hq(
             status_code=404,
 
             detail="That branch is not live."
-
         )
-
 
     # -----------------------------------------------------
     # Set HQ relay
@@ -1259,11 +1228,9 @@ async def connect_hq(
         body.branchId
     )
 
-
     stream_url = public_stream_url(
         session.mount
     )
-
 
     print(
 
@@ -1271,9 +1238,7 @@ async def connect_hq(
         f"{body.branchId}",
 
         flush=True
-
     )
-
 
     return {
 
@@ -1291,7 +1256,6 @@ async def connect_hq(
 
         "message":
             "Branch connected to Headquarters output."
-
     }
 
 
@@ -1304,18 +1268,12 @@ async def disconnect_hq():
 
     global hq_relay_branch
 
-
     hq_relay_branch = None
 
-
     print(
-
         "HQ relay disconnected.",
-
         flush=True
-
     )
-
 
     return {
 
@@ -1324,5 +1282,4 @@ async def disconnect_hq():
 
         "message":
             "HQ relay disconnected."
-
     }
