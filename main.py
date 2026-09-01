@@ -1205,3 +1205,4 @@ async def disconnect_hq():
         "message":
             "HQ relay disconnected."
     }
+```
