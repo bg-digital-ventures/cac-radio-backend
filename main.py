@@ -4,6 +4,8 @@ import socket
 import subprocess
 import threading
 import time
+import json
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Dict, Optional
 from urllib.parse import quote
@@ -143,6 +145,8 @@ class Session:
 sessions: Dict[str, Session] = {}
 
 hq_relay_branch: Optional[str] = None
+hq_relay_process: Optional[subprocess.Popen] = None
+hq_relay_lock = threading.Lock()
 
 
 # =========================================================
@@ -218,11 +222,37 @@ def mark_broadcast_ended(
 # MOUNT
 # =========================================================
 
-def mount_for(
-    branch_id: str
-) -> str:
+# Optional per-branch mount mapping. Example:
+# BRANCH_MOUNTS_JSON={"branch-a":"/branchA","branch-b":"/branchB"}
+try:
+    BRANCH_MOUNTS = json.loads(os.getenv("BRANCH_MOUNTS_JSON", "{}"))
+    if not isinstance(BRANCH_MOUNTS, dict):
+        BRANCH_MOUNTS = {}
+except Exception:
+    BRANCH_MOUNTS = {}
 
-    return ICECAST_MOUNT
+ICECAST_HQ_MOUNT = os.getenv("ICECAST_HQ_MOUNT", "/main")
+HQ_RELAY_INPUT_BASE = os.getenv("HQ_RELAY_INPUT_BASE", PUBLIC_BASE).rstrip("/")
+HQ_RELAY_SCHEME = os.getenv("HQ_RELAY_SCHEME", "https")
+
+
+def normalize_mount(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return "/"
+    return value if value.startswith("/") else "/" + value
+
+
+def mount_for(branch_id: str) -> str:
+    configured = BRANCH_MOUNTS.get(branch_id)
+    if configured:
+        return normalize_mount(configured)
+    # Keep the legacy mount for a single-branch deployment.
+    return normalize_mount(ICECAST_MOUNT)
+
+
+def hq_mount() -> str:
+    return normalize_mount(ICECAST_HQ_MOUNT)
 
 
 # =========================================================
@@ -258,7 +288,7 @@ def caster_config():
             ICECAST_SOURCE_USER,
 
         "mount":
-            ICECAST_MOUNT,
+            normalize_mount(ICECAST_MOUNT),
 
         "protocol":
             "icecast",
@@ -511,6 +541,10 @@ def cleanup_session(
         session.broadcast_id
     )
 
+    global hq_relay_branch
+    if hq_relay_branch == branch_id:
+        stop_hq_relay()
+
     current = sessions.get(
         branch_id
     )
@@ -526,6 +560,119 @@ def cleanup_session(
         f"Live session cleaned up for {branch_id}.",
         flush=True
     )
+
+
+# =========================================================
+# HQ RELAY
+# =========================================================
+
+def branch_input_url(session: Session) -> str:
+    """URL that FFmpeg uses to pull a live branch into HQ.
+
+    Caster.fm Free may protect direct stream URLs. In that case set
+    HQ_RELAY_INPUT_BASE to an authorized/direct input endpoint, or use a
+    streaming provider that permits server-side pulling.
+    """
+    if HQ_RELAY_INPUT_BASE:
+        return f"{HQ_RELAY_INPUT_BASE}{session.mount}"
+    return f"{HQ_RELAY_SCHEME}://{ICECAST_HOST}:{ICECAST_PORT}{session.mount}"
+
+
+def hq_relay_cmd(session: Session):
+    if not ICECAST_SOURCE_PASSWORD:
+        raise RuntimeError("ICECAST_SOURCE_PASSWORD is not configured.")
+
+    safe_user = quote(ICECAST_SOURCE_USER, safe="")
+    safe_password = quote(ICECAST_SOURCE_PASSWORD, safe="")
+    output = (
+        f"icecast://{safe_user}:{safe_password}@"
+        f"{ICECAST_HOST}:{ICECAST_PORT}{hq_mount()}"
+    )
+
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "info",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-i", branch_input_url(session),
+        "-vn", "-c:a", "libmp3lame",
+        "-b:a", "96k", "-ar", "44100", "-ac", "2",
+        "-content_type", "audio/mpeg",
+        "-ice_name", "CAC Radio HQ",
+        "-ice_description", "CAC Radio Headquarters Feed",
+        "-ice_genre", "Christian Radio",
+        "-ice_public", "1",
+        "-f", "mp3", output
+    ]
+
+
+def stop_hq_relay():
+    global hq_relay_process, hq_relay_branch
+    with hq_relay_lock:
+        process = hq_relay_process
+        hq_relay_process = None
+        hq_relay_branch = None
+
+    if process is not None:
+        stop_ffmpeg(process)
+        print("HQ relay stopped.", flush=True)
+
+
+def log_hq_relay(process):
+    try:
+        if process.stderr is None:
+            return
+        for raw_line in iter(process.stderr.readline, b""):
+            if not raw_line:
+                break
+            text = raw_line.decode(errors="replace").rstrip()
+            if text:
+                print(f"[FFmpeg HQ] {text}", flush=True)
+    except Exception as exc:
+        print(f"HQ relay logger error: {exc}", flush=True)
+
+
+def start_hq_relay(session: Session):
+    global hq_relay_process, hq_relay_branch
+
+    # A previous relay must be stopped before switching branches.
+    stop_hq_relay()
+
+    command = hq_relay_cmd(session)
+    print(
+        f"Starting HQ relay from {session.branch_id} "
+        f"({session.mount}) -> {hq_mount()}",
+        flush=True
+    )
+
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+
+    with hq_relay_lock:
+        hq_relay_process = process
+        hq_relay_branch = session.branch_id
+
+    threading.Thread(
+        target=log_hq_relay, args=(process,), daemon=True
+    ).start()
+
+    # Give FFmpeg a moment to fail fast on bad input/output credentials.
+    time.sleep(0.35)
+    if process.poll() is not None:
+        with hq_relay_lock:
+            hq_relay_process = None
+            hq_relay_branch = None
+        raise RuntimeError(
+            f"HQ relay FFmpeg exited immediately with code {process.returncode}. "
+            "Check the branch input URL, Caster mount, and HQ mount/password."
+        )
+
+    return process
 
 
 # =========================================================
@@ -592,6 +739,13 @@ async def health():
 
         "hqRelayBranch":
             hq_relay_branch,
+
+        "hqRelayAlive":
+            hq_relay_process is not None
+            and hq_relay_process.poll() is None,
+
+        "hqMount":
+            hq_mount(),
 
         "caster":
             {
@@ -708,6 +862,20 @@ async def start_live(
     mount = mount_for(
         body.branchId
     )
+
+    # Never allow two active branches to publish to the same Icecast mount.
+    for active in sessions.values():
+        if active.mount == mount:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Icecast mount {mount} is already in use by another live branch."
+            )
+
+    if mount == hq_mount():
+        raise HTTPException(
+            status_code=409,
+            detail="A branch mount cannot be the same as the HQ output mount."
+        )
 
     session = Session(
 
@@ -1140,43 +1308,40 @@ async def connect_hq(
     )
 
     if not session:
-
         raise HTTPException(
-
             status_code=404,
-
             detail="That branch is not live."
         )
 
-    hq_relay_branch = (
-        body.branchId
-    )
+    if session.process is None or session.process.poll() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="That branch is live in Firestore but its audio publisher is not connected."
+        )
 
-    stream_url = public_stream_url(
-        session.mount
-    )
+    try:
+        start_hq_relay(session)
+    except Exception as exc:
+        print(f"Unable to connect HQ to {body.branchId}: {exc}", flush=True)
+        raise HTTPException(
+            status_code=502,
+            detail=f"HQ relay could not start: {exc}"
+        )
+
+    stream_url = public_stream_url(hq_mount())
 
     print(
-        f"HQ relay connected to {body.branchId}",
+        f"HQ relay connected to {body.branchId}.",
         flush=True
     )
 
     return {
-
-        "ok":
-            True,
-
-        "branchId":
-            body.branchId,
-
-        "publicStreamUrl":
-            stream_url,
-
-        "mount":
-            session.mount,
-
-        "message":
-            "Branch connected to Headquarters output."
+        "ok": True,
+        "branchId": body.branchId,
+        "sourceMount": session.mount,
+        "mount": hq_mount(),
+        "publicStreamUrl": stream_url,
+        "message": "Branch audio is now being relayed to the Headquarters output."
     }
 
 
@@ -1187,9 +1352,7 @@ async def connect_hq(
 @app.post("/api/live/disconnect-hq")
 async def disconnect_hq():
 
-    global hq_relay_branch
-
-    hq_relay_branch = None
+    stop_hq_relay()
 
     print(
         "HQ relay disconnected.",
@@ -1197,10 +1360,6 @@ async def disconnect_hq():
     )
 
     return {
-
-        "ok":
-            True,
-
-        "message":
-            "HQ relay disconnected."
+        "ok": True,
+        "message": "HQ relay disconnected."
     }
